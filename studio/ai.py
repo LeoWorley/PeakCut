@@ -16,7 +16,6 @@ import subprocess
 import tempfile
 import threading
 import time
-from pathlib import Path
 
 import httpx
 
@@ -35,57 +34,13 @@ PROVIDERS = {
     "codex_cli": ("Codex CLI", "", "codex_cli", "", "default"),
 }
 ALIASES = {"google": "gemini", "grok": "xai", "claude": "anthropic", "local": "ollama"}
-NO_KEY = {"ollama", "custom", "codex_cli"}  # local models, gateways and the signed-in Codex CLI need no key
+NO_KEY = {"ollama", "custom", "codex_cli"}  # local models, local gateways and the signed-in Codex CLI need no API key
 
 # ---------------------------------------------------------------- the settings in use
 _lock = threading.Lock()
 _saved = {"at": None, "data": {}}
 _codex_lock = threading.Lock()
 _codex_cached = {"at": 0.0, "binary": None, "env": {}, "status": None}
-
-
-def codex_status(refresh=False) -> dict:
-    """Whether Codex CLI is installed and its existing local login can be used."""
-    now = time.monotonic()
-    with _codex_lock:
-        if not refresh and _codex_cached["status"] is not None and now - _codex_cached["at"] < 30:
-            return dict(_codex_cached["status"])
-        binary = shutil.which("codex")
-        if not binary:
-            status = {"installed": False, "authenticated": False,
-                      "error": "Codex CLI was not found. Install it and restart PeakCut."}
-        else:
-            _codex_cached["binary"] = binary
-            try:
-                result = subprocess.run([binary, "login", "status"], capture_output=True, text=True,
-                                        timeout=10, check=False)
-                authenticated = result.returncode == 0
-                status = {"installed": True, "authenticated": authenticated,
-                          "error": None if authenticated else "Run `codex login` in Terminal, then test again."}
-            except (OSError, subprocess.SubprocessError):
-                status = {"installed": True, "authenticated": False,
-                          "error": "Could not check the Codex CLI login. Run `codex login` in Terminal, then test again."}
-        _codex_cached.update(at=now, status=status)
-        return dict(status)
-
-
-def _codex_env(home=None) -> dict:
-    """Make an environment that uses the saved login but does not load the user's Codex config."""
-    env = os.environ.copy()
-    if home is not None:
-        isolated = home / "codex-home"
-        isolated.mkdir(parents=True, exist_ok=True)
-        source = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "auth.json"
-        if source.is_file():
-            target = isolated / "auth.json"
-            try:
-                target.symlink_to(source)
-            except OSError:
-                shutil.copyfile(source, target)
-        env["CODEX_HOME"] = str(isolated)
-    env["NO_COLOR"] = "1"
-    env["TERM"] = "dumb"
-    return env
 
 
 def _file():
@@ -113,10 +68,13 @@ def current() -> dict:
     d = _from_dashboard()
     p = str(d.get("provider") or config.AI_PROVIDER or "").strip().lower()
     p = ALIASES.get(p, p)
+    k = str(d["key"]) if d.get("provider") and "key" in d else config.ai_key()
+    if p == "codex_cli":
+        k = ""
     return {"provider": p,
             "models": list(d["models"]) if d.get("provider") else list(config.AI_MODELS),
             "base_url": (str(d.get("base_url") or "") if d.get("provider") else config.AI_BASE_URL).rstrip("/"),
-            "key": "" if p == "codex_cli" else (str(d["key"]) if d.get("provider") and "key" in d else config.ai_key())}
+            "key": k}
 
 
 def provider() -> str:
@@ -152,12 +110,13 @@ def public() -> dict:
     """What the settings page may see. The key itself never leaves the server: only whether there is one, and
     its last four characters so the owner can tell which key it is."""
     c = current()
-    return {"provider": c["provider"], "models": c["models"], "base_url": c["base_url"], "has_key": bool(c["key"]),
+    out = {"provider": c["provider"], "models": c["models"], "base_url": c["base_url"], "has_key": bool(c["key"]),
             "key_hint": c["key"][-4:] if len(c["key"]) >= 12 else "", "ready": ready(), "label": label(),
             "saved_here": bool(_from_dashboard().get("provider")),
-            "codex": codex_status(),
             "providers": [{"id": k, "label": v[0], "address": v[1], "needs_key": k not in NO_KEY, "key_url": v[3], "example": v[4]}
                           for k, v in PROVIDERS.items()]}
+    out["codex"] = codex_status() if c["provider"] == "codex_cli" else None
+    return out
 
 
 def save(provider_id: str, model_ids, address: str = "", new_key=None) -> dict:
@@ -169,6 +128,8 @@ def save(provider_id: str, model_ids, address: str = "", new_key=None) -> dict:
     if isinstance(model_ids, str):
         model_ids = model_ids.split(",")
     ms = [str(m).strip()[:120] for m in (model_ids or []) if str(m).strip()][:5]
+    if p == "codex_cli" and not ms:
+        ms = ["default"]
     if not ms:
         raise ValueError("Enter the model to use.")
     if any(not re.fullmatch(r"[\w.\-:/@]+", m) for m in ms):
@@ -179,7 +140,7 @@ def save(provider_id: str, model_ids, address: str = "", new_key=None) -> dict:
     if p == "custom" and not address:
         raise ValueError("A custom service needs its address, for example http://127.0.0.1:1234/v1")
     old = current()
-    k = old["key"] if new_key is None and old["provider"] == p else str(new_key or "").strip()[:400]
+    k = "" if p == "codex_cli" else (old["key"] if new_key is None and old["provider"] == p else str(new_key or "").strip()[:400])
     if not k and p not in NO_KEY:
         raise ValueError("Paste the key for this service.")
     with _lock:
@@ -192,6 +153,7 @@ def save(provider_id: str, model_ids, address: str = "", new_key=None) -> dict:
             pass
         tmp.replace(f)
         _saved["at"] = None
+        _codex_cached.update(at=0.0, status=None)
     return public()
 
 
@@ -201,37 +163,28 @@ def list_models(provider_id=None, address=None, with_key=None) -> list:
     p = ALIASES.get(str(provider_id or c["provider"]).lower(), str(provider_id or c["provider"]).lower())
     if p not in PROVIDERS:
         raise ValueError("Choose one of the AI services in the list.")
-    k = str(with_key or "").strip() or (c["key"] if c["provider"] == p else "")
     if p == "codex_cli":
-        status = codex_status()
-        if not status["installed"] or not status["authenticated"]:
-            raise ValueError(status["error"] or "Run `codex login` in Terminal, then try again.")
-        binary = _codex_cached.get("binary") or shutil.which("codex")
+        binary, env = _codex_context()
         if not binary:
-            raise ValueError("Codex CLI was not found. Install it and restart PeakCut.")
-        with tempfile.TemporaryDirectory(prefix="peakcut-codex-models-") as tmp:
-            result = subprocess.run([binary, "debug", "models"], capture_output=True, text=True, timeout=20,
-                                    check=False, cwd=tmp, env=_codex_env(Path(tmp)))
-        if result.returncode:
-            raise AIError((result.stderr or result.stdout or "Codex CLI could not list models.")[:300])
-        found = []
-        output = (result.stdout or "").strip()
+            raise AIError("Codex CLI was not found. Install it and make sure `codex` is available in your shell.")
         try:
-            data = json.loads(output)
-        except ValueError:
-            data = None
-        if isinstance(data, dict):
-            data = data.get("models") or data.get("data") or []
-        if isinstance(data, list):
-            found.extend(str(m.get("id") or m.get("model") or "") if isinstance(m, dict) else str(m) for m in data)
-        if not found:
-            for line in output.splitlines():
-                match = re.match(r"\s*([A-Za-z0-9][A-Za-z0-9._:/-]{1,119})\s{2,}", line)
-                if match and match.group(1).lower() not in {"model", "models", "name", "id", "default"}:
-                    found.append(match.group(1))
-        if not found:
-            found = re.findall(r"\b(?:gpt-[A-Za-z0-9._-]+|o[1-9][A-Za-z0-9._-]*|codex-[A-Za-z0-9._-]+)\b", output)
-        return ["default"] + sorted({m.strip() for m in found if m.strip() and m.strip() != "default"})[:399]
+            result = subprocess.run([binary, "debug", "models"], capture_output=True, text=True,
+                                    timeout=30, cwd=tempfile.gettempdir(), env=env)
+            if result.returncode != 0:
+                result = subprocess.run([binary, "debug", "models", "--bundled"], capture_output=True, text=True,
+                                        timeout=30, cwd=tempfile.gettempdir(), env=env)
+        except subprocess.TimeoutExpired as e:
+            raise AIError("Timed out while asking Codex CLI for its model list.") from e
+        if result.returncode != 0:
+            raise AIError("Codex CLI could not list models. Check `codex login status` and try again.")
+        try:
+            data = json.loads(result.stdout)
+        except ValueError as e:
+            raise AIError("Codex CLI returned an unreadable model list.") from e
+        found = {str(m.get("slug", "")).strip() for m in data.get("models", [])
+                 if isinstance(m, dict) and m.get("visibility", "list") == "list"}
+        return ["default", *sorted(m for m in found if m and m != "default")][:400]
+    k = str(with_key or "").strip() or (c["key"] if c["provider"] == p else "")
     base = str(address or "").strip().rstrip("/") or (c["base_url"] if c["provider"] == p else "") or PROVIDERS[p][1]
     if not base:
         raise ValueError("Enter the service's address first.")
@@ -258,7 +211,8 @@ def test() -> dict:
     ms = models()
     if not ready():
         if provider() == "codex_cli":
-            raise ValueError(codex_status()["error"] or "Run `codex login` in Terminal first.")
+            status = codex_status()
+            raise ValueError(status["error"] or "Choose a Codex model and log in to Codex CLI first.")
         raise ValueError("Save a service, a model and a key first.")
     out, sent, wrote = call(ms[0], 'Answer with a JSON array that holds the single string "ok".', {"type": "ARRAY", "items": {"type": "STRING"}})
     return {"ok": True, "model": ms[0], "tokens": sent + wrote, "answer": str(out)[:80]}
@@ -275,8 +229,18 @@ def explain(e) -> str:
     """What went wrong with an AI call, in words the owner can act on."""
     text, low = str(e), str(e).lower()
     name = (models() or ["?"])[0]
-    if provider() == "codex_cli" and ("login" in low or "auth" in low or "not logged" in low):
-        return "Codex CLI is not logged in. Run `codex login` in Terminal, then test again."
+    if provider() == "codex_cli":
+        if "not found" in low or "not installed" in low:
+            return "Codex CLI was not found. Install it, then restart PeakCut."
+        if "not logged in" in low or "not authenticated" in low or "login status" in low:
+            return "Codex CLI is installed but not logged in. Run `codex login` in Terminal, then test again."
+        if "model" in low and ("unknown" in low or "not found" in low):
+            return f"Codex does not recognize the model \"{name}\". Press Find models and choose an available model."
+        if "429" in text or "rate limit" in low or "usage limit" in low or "quota" in low:
+            return "Codex reports a usage limit. Check your Codex account or try again later."
+        if "timed out" in low or "timeout" in low:
+            return "Codex CLI timed out. Check that it is logged in and try again."
+        return "Codex CLI could not complete the request. Check `codex login status` and the selected model."
     if "404" in text or "not found" in low or "does not exist" in low or "unknown model" in low or "not_found" in low:
         return f"{label()} doesn't know the model \"{name}\". Open Settings, AI, press Find models and pick one from the list."
     if "401" in text or "403" in text or "api key" in low or "api_key" in low or "unauthorized" in low or "permission" in low:
@@ -299,6 +263,134 @@ def clear_problem():
     problem.update(text="", at=0.0)
 
 
+def _codex_context() -> tuple[str | None, dict]:
+    """Find Codex even when PeakCut was started by a macOS GUI with a short PATH."""
+    cached = _codex_cached
+    if cached.get("binary"):
+        return cached["binary"], _codex_runtime_env(cached["env"])
+
+    shell_env = {}
+    shells = []
+    if os.environ.get("SHELL"):
+        shells.append(os.environ["SHELL"])
+    shells.extend(["/bin/zsh", "/bin/bash"])
+    for shell in dict.fromkeys(shells):
+        if not os.path.isfile(shell):
+            continue
+        try:
+            result = subprocess.run([shell, "-ilc", "env -0"], capture_output=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode != 0:
+            continue
+        for entry in result.stdout.split(b"\0"):
+            key_name, sep, value = entry.partition(b"=")
+            if sep:
+                shell_env[key_name.decode(errors="replace")] = value.decode(errors="replace")
+        if shell_env.get("PATH"):
+            break
+
+    env = os.environ.copy()
+    if shell_env.get("PATH"):
+        env["PATH"] = shell_env["PATH"]
+    if shell_env.get("CODEX_HOME") and not env.get("CODEX_HOME"):
+        env["CODEX_HOME"] = shell_env["CODEX_HOME"]
+    binary = shutil.which("codex", path=os.environ.get("PATH", "")) or shutil.which("codex", path=env.get("PATH", ""))
+    with _codex_lock:
+        _codex_cached.update(binary=binary, env={k: env[k] for k in ("PATH", "CODEX_HOME") if env.get(k)})
+    return binary, _codex_runtime_env(_codex_cached["env"])
+
+
+def _codex_runtime_env(overrides: dict) -> dict:
+    """Keep the local CLI login, not an unrelated API-key environment variable."""
+    env = os.environ.copy()
+    env.update(overrides)
+    env.pop("OPENAI_API_KEY", None)
+    env.pop("CODEX_API_KEY", None)
+    return env
+
+
+def codex_status(refresh: bool = False) -> dict:
+    """Return installed/login status, cached briefly because status endpoints poll frequently."""
+    now = time.monotonic()
+    with _codex_lock:
+        if not refresh and _codex_cached["status"] is not None and now - _codex_cached["at"] < 20:
+            return dict(_codex_cached["status"])
+    binary, env = _codex_context()
+    if not binary:
+        result = {"installed": False, "authenticated": False, "error": "Codex CLI was not found on PATH."}
+    else:
+        try:
+            proc = subprocess.run([binary, "login", "status"], capture_output=True, text=True,
+                                  timeout=15, cwd=tempfile.gettempdir(), env=env)
+            output = (proc.stdout + "\n" + proc.stderr).strip()
+            authenticated = proc.returncode == 0 and "logged in" in output.lower() and "not logged in" not in output.lower()
+            result = {"installed": True, "authenticated": authenticated,
+                      "error": None if authenticated else ("Codex CLI is installed but not logged in. Run `codex login` in Terminal." if "not logged in" in output.lower() or not output else "Could not verify Codex CLI login status.")}
+        except subprocess.TimeoutExpired:
+            result = {"installed": True, "authenticated": False, "error": "Timed out checking Codex CLI login status."}
+        except OSError:
+            result = {"installed": False, "authenticated": False, "error": "Codex CLI could not be started."}
+    with _codex_lock:
+        _codex_cached.update(at=now, status=result)
+    return dict(result)
+
+
+def _codex_cli(model: str, prompt: str, schema: dict):
+    """Use the logged-in Codex CLI for one schema-constrained classification request."""
+    binary, env = _codex_context()
+    if not binary:
+        raise AIError("Codex CLI was not found. Install it and make sure `codex` is available in your shell.")
+    status = codex_status()
+    if not status["authenticated"]:
+        raise AIError(status["error"] or "Codex CLI is not logged in.")
+
+    with tempfile.TemporaryDirectory(prefix="peakcut-codex-") as workdir:
+        schema_path = os.path.join(workdir, "schema.json")
+        output_schema = {"type": "OBJECT", "properties": {"items": _codex_strict_schema(schema)},
+                         "required": ["items"], "additionalProperties": False}
+        with open(schema_path, "w", encoding="utf-8") as f:
+            json.dump(_json_schema(output_schema), f)
+        args = [binary, "exec", "--ephemeral", "--ignore-user-config", "--sandbox", "read-only",
+                "--ask-for-approval", "never", "--skip-git-repo-check", "--json", "--output-schema", schema_path]
+        if model and model != "default":
+            args.extend(["--model", model])
+        args.append("-")
+        try:
+            proc = subprocess.run(args, input=_wrapped(prompt, schema), capture_output=True, text=True, timeout=180,
+                                  cwd=workdir, env=env)
+        except subprocess.TimeoutExpired as e:
+            raise AIError("Codex CLI timed out after 180 seconds.") from e
+        except OSError as e:
+            raise AIError(f"Codex CLI could not be started: {e}") from e
+
+    usage_info, answer, cli_error = {}, "", ""
+    for line in proc.stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if event.get("type") == "turn.completed":
+            usage_info = event.get("usage") or {}
+        elif event.get("type") == "turn.failed":
+            cli_error = str((event.get("error") or {}).get("message") or "")
+        elif event.get("type") == "item.completed":
+            item = event.get("item") or {}
+            if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
+                answer = item["text"]
+    if proc.returncode != 0:
+        detail = cli_error or proc.stderr.strip()
+        detail = detail[:300] if detail else f"exit code {proc.returncode}"
+        for secret_name in ("OPENAI_API_KEY", "CODEX_API_KEY"):
+            secret = env.get(secret_name, "")
+            if secret:
+                detail = detail.replace(secret, "<redacted>")
+        raise AIError(f"Codex CLI failed: {detail}")
+    if not answer:
+        raise AIError("Codex CLI finished without a final structured response.")
+    return _parse(answer), int(usage_info.get("input_tokens") or 0), int(usage_info.get("output_tokens") or 0)
+
+
 def _fail(r, model):
     text = r.text[:300].replace(key() or "\0", "<key>")
     raise AIError(f"HTTP {r.status_code} {text}")
@@ -312,6 +404,40 @@ def _json_schema(s):
     if isinstance(s, list):
         return [_json_schema(x) for x in s]
     return s
+
+
+def _codex_strict_schema(schema):
+    """Make PeakCut's schemas valid for Codex structured output, which is strict."""
+    def nullable(s):
+        out = dict(s)
+        kind = out.get("type")
+        if "enum" in out and None not in out["enum"]:
+            out["enum"] = [*out["enum"], None]
+        if isinstance(kind, str):
+            out["type"] = [kind, "null"]
+        elif isinstance(kind, list) and "null" not in kind:
+            out["type"] = [*kind, "null"]
+        elif kind is None and "enum" not in out:
+            out = {"anyOf": [out, {"type": "null"}]}
+        return out
+
+    def strict(node):
+        if isinstance(node, list):
+            return [strict(item) for item in node]
+        if not isinstance(node, dict):
+            return node
+        out = {key: strict(value) for key, value in node.items()}
+        if out.get("type") == "object":
+            properties = out.setdefault("properties", {})
+            required = set(out.get("required", []))
+            for name, prop in properties.items():
+                if name not in required:
+                    properties[name] = nullable(prop)
+            out["required"] = list(properties)
+            out["additionalProperties"] = False
+        return out
+
+    return strict(_json_schema(schema))
 
 
 def _wrapped(prompt, schema):
@@ -335,86 +461,12 @@ def _parse(text):
     return out
 
 
-def _codex_schema(schema):
-    """Convert a chat schema to Codex's strict structured-output JSON Schema."""
-    schema = _json_schema(schema)
-    if isinstance(schema, dict) and schema.get("type") == "array":
-        schema = {"type": "object", "properties": {"items": schema}, "required": ["items"],
-                  "additionalProperties": False}
-
-    def strict(node):
-        if not isinstance(node, dict):
-            return node
-        out = dict(node)
-        if out.get("type") == "object":
-            properties = out.get("properties") or {}
-            required = set(out.get("required") or [])
-            fixed = {}
-            for name, value in properties.items():
-                value = strict(value)
-                fixed[name] = value if name in required else {"anyOf": [value, {"type": "null"}]}
-            out["properties"] = fixed
-            out["required"] = list(properties)
-            out["additionalProperties"] = False
-        elif out.get("type") == "array" and "items" in out:
-            out["items"] = strict(out["items"])
-        for key in ("anyOf", "oneOf", "allOf"):
-            if key in out:
-                out[key] = [strict(value) for value in out[key]]
-        return out
-
-    return strict(schema)
-
-
-def _codex(model, prompt, schema):
-    status = codex_status()
-    if not status["installed"] or not status["authenticated"]:
-        raise AIError(status["error"] or "Run `codex login` in Terminal first.")
-    binary = _codex_cached.get("binary") or shutil.which("codex")
-    if not binary:
-        raise AIError("Codex CLI was not found. Install it and restart PeakCut.")
-    with tempfile.TemporaryDirectory(prefix="peakcut-codex-") as tmp:
-        root = Path(tmp)
-        schema_path = root / "schema.json"
-        schema_path.write_text(json.dumps(_codex_schema(schema)), encoding="utf-8")
-        command = [binary, "exec", "--ephemeral", "--ignore-user-config", "--skip-git-repo-check",
-                   "--sandbox", "read-only", "--output-schema", str(schema_path), "--json"]
-        if model and model != "default":
-            command.extend(["--model", model])
-        command.append("-")
-        try:
-            result = subprocess.run(command, input=prompt, cwd=tmp, capture_output=True, text=True, timeout=180,
-                                    check=False, env=_codex_env(root))
-        except (OSError, subprocess.SubprocessError) as e:
-            raise AIError(f"Could not run Codex CLI: {e}") from e
-    if result.returncode:
-        message = (result.stderr or result.stdout or "Codex CLI did not complete the request.").strip()[:300]
-        raise AIError(message)
-    answer, sent, wrote = "", 0, 0
-    for line in (result.stdout or "").splitlines():
-        try:
-            event = json.loads(line)
-        except ValueError:
-            continue
-        if event.get("type") == "item.completed":
-            item = event.get("item") or {}
-            if item.get("type") in ("agent_message", "assistant_message"):
-                answer = item.get("text") or answer
-        elif event.get("type") == "turn.completed":
-            usage = event.get("usage") or {}
-            sent = int(usage.get("input_tokens") or 0)
-            wrote = int(usage.get("output_tokens") or 0)
-    if not answer:
-        raise AIError("Codex CLI finished without a structured answer.")
-    return _parse(answer), sent, wrote
-
-
 # ---------------------------------------------------------------- one call
 def call(model: str, prompt: str, schema: dict):
     """Ask one model. Returns (the parsed JSON answer, tokens sent, tokens written back)."""
+    if provider() == "codex_cli":
+        return _codex_cli(model, prompt, schema)
     how = PROVIDERS[provider()][2]
-    if how == "codex_cli":
-        return _codex(model, prompt, schema)
     return {"gemini": _gemini, "openai": _openai, "anthropic": _anthropic}[how](model, prompt, schema)
 
 

@@ -79,10 +79,10 @@ PEAKCUT_AI_KEY=your-key-here
 | `custom` | Any OpenAI-compatible address: also set `PEAKCUT_AI_BASE_URL` | |
 | `codex_cli` | Codex CLI using the local `codex login` session; no API key | |
 
-- For `codex_cli`, set `PEAKCUT_AI_MODELS=default` to use Codex CLI's built-in default model, or choose an id shown by
-  `codex debug models` in Settings.
 - `PEAKCUT_AI_MODELS` is the model id exactly as the service names it. Model names change often, so check the
   service's current list. Several ids separated by commas are tried in order, which gives you a fallback.
+- For `codex_cli`, set `PEAKCUT_AI_MODELS=default` to use Codex CLI's built-in default model, or choose an id shown by
+  `codex debug models` in Settings.
 - A fast, inexpensive model is the right choice. A one-hour video is read in about four requests.
 - You pay the AI service directly for what you use. The **AI usage** page in the app shows how many requests and
   tokens each video took.
