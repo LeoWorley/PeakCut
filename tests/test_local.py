@@ -73,6 +73,11 @@ check("saving again without typing the key keeps it", (r.status_code, r.json()["
 check("changing service without a key is refused, and the old key is not carried over", put({"provider": "openai", "models": "m"}).status_code, 400)
 r = put({"provider": "ollama", "models": "llama"})
 check("a model on this machine needs no key", (r.status_code, r.json()["ready"], ai.key()), (200, True, ""))
+real_codex_status = ai.codex_status
+ai.codex_status = lambda refresh=False: {"installed": True, "authenticated": True, "error": None}
+r = put({"provider": "codex_cli", "models": "default", "key": ""})
+check("Codex CLI saves with no API key", (r.status_code, r.json()["ready"], r.json()["has_key"], ai.key()), (200, True, False, ""))
+ai.codex_status = real_codex_status
 
 
 # ---- finding models and testing, with the network replaced

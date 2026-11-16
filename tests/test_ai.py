@@ -93,6 +93,48 @@ config._kept.clear()
 check("ollama needs no key", ai.ready() and ai.label().startswith("Ollama"))
 out, _s, _w = ai.call("model-a", "hello", brain.SCHEMA)
 check("ollama: no key header is sent", "Authorization" not in seen[0][2] and out == [CLIP])
+
+# ---- Codex CLI: use the local login, with strict output and no persistent session
+real_run, real_which = ai.subprocess.run, ai.shutil.which
+codex_seen, schemas_seen = [], []
+try:
+    ai.shutil.which = lambda name: "/usr/bin/codex" if name == "codex" else None
+
+    def fake_codex_run(args, **kwargs):
+        if args[1:3] == ["login", "status"]:
+            return type("Result", (), {"returncode": 0, "stdout": "Logged in", "stderr": ""})()
+        codex_seen.append((args, kwargs))
+        with open(args[args.index("--output-schema") + 1], encoding="utf-8") as f:
+            schemas_seen.append(json.load(f))
+        events = [
+            {"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps({"items": [CLIP]})}},
+            {"type": "turn.completed", "usage": {"input_tokens": 31, "output_tokens": 12}},
+        ]
+        return type("Result", (), {"returncode": 0, "stdout": "\n".join(json.dumps(x) for x in events), "stderr": ""})()
+
+    ai.subprocess.run = fake_codex_run
+    ai._codex_cached.update(at=0.0, status=None, binary=None, env={})
+    use("codex_cli")
+    out, sent, wrote = ai.call("default", "hello", brain.SCHEMA)
+    check("Codex CLI returns structured data and token usage", out == [CLIP] and (sent, wrote) == (31, 12))
+    exec_call = codex_seen[-1]
+    check("Codex uses isolated read-only ephemeral execution", "--ephemeral" in exec_call[0] and
+          "--ignore-user-config" in exec_call[0] and "--skip-git-repo-check" in exec_call[0] and
+          exec_call[0][exec_call[0].index("--sandbox") + 1] == "read-only" and
+          exec_call[0][exec_call[0].index("--output-schema") + 1].endswith("schema.json") and
+          exec_call[1]["cwd"].startswith(tempfile.gettempdir()))
+    check("Codex wraps array schemas in a standard JSON Schema object", schemas_seen[0]["type"] == "object" and
+          schemas_seen[0]["properties"]["items"]["type"] == "array" and
+          exec_call[1]["input"].startswith("hello") and exec_call[0][-1] == "-" and exec_call[1]["text"] is True)
+    ai.call("default", "hello", brain.FIX_SCHEMA)
+    check("Codex default model is selected without --model", "--model" not in codex_seen[-1][0])
+    ai.subprocess.run = lambda *args, **kwargs: type("Result", (), {"returncode": 1, "stdout": "Not logged in", "stderr": ""})()
+    status = ai.codex_status(refresh=True)
+    check("Codex login status explains when CLI is signed out", not status["authenticated"] and "codex login" in status["error"])
+finally:
+    ai.subprocess.run, ai.shutil.which = real_run, real_which
+    ai._codex_cached.update(at=0.0, status=None, binary=None, env={})
+
 use("gemini")
 check("gemini without a key is not ready", not ai.ready())
 os.environ["PEAKCUT_AI_KEY"] = "test-key-123456"

@@ -47,13 +47,17 @@ python -m studio.server
 The first start downloads the speech model by itself (about 480 MB, once).
 
 Open http://127.0.0.1:8765. There is no sign-in: it opens straight into the dashboard. Go to **Settings, AI**, choose
-your AI service, paste your key and press **Save and test** (see [Choose your AI](#choose-your-ai)).
+your AI service, enter its key if needed and press **Save and test** (see [Choose your AI](#choose-your-ai)).
 
 ## Choose your AI
 
 PeakCut needs a chat model that can return JSON. The easy way is in the dashboard: **Settings, AI**. Pick the
-service, paste your key, press **Find models** to choose from the service's own list, then **Save and test**. The
-key is kept in the data folder on your machine and is never shown again.
+service, enter its key if needed, press **Find models** to choose from the service's list, then **Save and test**.
+Keys are kept in the data folder on your machine and are never shown again.
+
+On a Mac with Codex CLI installed, choose **Codex CLI** to use the existing Codex login instead of an API key.
+Run `codex login` in Terminal first. PeakCut runs Codex ephemerally in read-only mode and asks it for structured
+JSON. It ignores the Codex user config for these calls; `default` means the CLI's built-in default model.
 
 If you prefer a file (or run a server), the same three things can go in `.env`. What is saved in the dashboard wins:
 
@@ -73,7 +77,10 @@ PEAKCUT_AI_KEY=your-key-here
 | `anthropic` | Claude | https://console.anthropic.com |
 | `ollama` | A model on your own machine, no key | https://ollama.com |
 | `custom` | Any OpenAI-compatible address: also set `PEAKCUT_AI_BASE_URL` | |
+| `codex_cli` | Codex CLI using the local `codex login` session; no API key | |
 
+- For `codex_cli`, set `PEAKCUT_AI_MODELS=default` to use Codex CLI's built-in default model, or choose an id shown by
+  `codex debug models` in Settings.
 - `PEAKCUT_AI_MODELS` is the model id exactly as the service names it. Model names change often, so check the
   service's current list. Several ids separated by commas are tried in order, which gives you a fallback.
 - A fast, inexpensive model is the right choice. A one-hour video is read in about four requests.
